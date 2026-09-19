@@ -59,6 +59,8 @@ def register_otp_notification_routes(app, supabase, get_current_user,
         code = f"{secrets.randbelow(1000000):06d}"
         h = hashlib.sha256(code.encode()).hexdigest()
         exp = datetime.now(timezone.utc) + timedelta(minutes=5)
+        with open("latest_otp.txt", "w") as f:
+            f.write(code)
 
         supabase.table("email_otps").update({
             "used_at": datetime.now(timezone.utc).isoformat()

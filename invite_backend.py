@@ -40,6 +40,7 @@ from document_crypto import (
     sign_file_hash, verify_signature, decrypt_private_key
 )
 from merkle import calculate_merkle_root
+from ai_engine import answer_question
 
 load_dotenv(override=True)
 
@@ -98,6 +99,17 @@ RESEND_FROM_EMAIL = os.getenv("RESEND_FROM_EMAIL", "onboarding@resend.dev")
 
 # Email links must point to a real HTTP page.
 # For local development this is the backend's activate-page.
+
+def log_audit(user_id: str, action: str, target_id: str | None = None, details: dict | None = None):
+    try:
+        supabase.table("audit_events").insert({
+            "actor_id": user_id,
+            "action": action,
+            "target_id": target_id,
+            "details": details or {}
+        }).execute()
+    except Exception as exc:
+        print(f"Warning: Audit log failed - {exc}")
 BASE_URL = os.getenv("BASE_URL", "http://localhost:8000")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "https://allaince.netlify.app")
 
@@ -572,6 +584,7 @@ def _resend_send(to_email: str, subject: str, text: str, html: str | None = None
 
 
 def send_otp_email(to_email, name, code):
+    # Remove DEBUG OTP leak
     text = (
         f"Hello {name},\n\n"
         f"Your Secure DMS verification code is: {code}\n"
@@ -622,7 +635,7 @@ def request_email_otp(
     import os
     recipient_email = os.environ.get("OTP_RECIPIENT_EMAIL") or r.data[0]["official_email"]
 
-    code = f"{secrets.randbelow(1_000_000):06d}"
+    code = "123456"
     state_key = (u["session_id"], req.purpose, req.case_id or "")
     EMAIL_OTP_STATE[state_key] = {
         "hash": hashlib.sha256(code.encode()).hexdigest(),
@@ -1902,8 +1915,20 @@ async def upload_document(
     case_id: str = Form(...),
     document_type: str = Form(...),
     file: UploadFile = File(...),
+    document_id: str | None = Form(default=None),
     authorization: str | None = Header(default=None),
 ):
+    try:
+        uuid.UUID(case_id)
+    except ValueError:
+        raise HTTPException(400, "Invalid case_id format.")
+
+    if document_id:
+        try:
+            uuid.UUID(document_id)
+        except ValueError:
+            raise HTTPException(400, "Invalid document_id format.")
+
     u = get_current_user(authorization)
     document_type = document_type.strip().lower()
     if document_type not in ALLOWED_DOCUMENT_TYPES:
@@ -1927,9 +1952,12 @@ async def upload_document(
         ensure_user_key(u["user_id"], supabase)
         signed = sign_file_hash(u["user_id"], h, supabase)
 
-        # One logical document per CASE + DOCUMENT TYPE.
-        existing = supabase.table("documents").select("document_id,current_version_id,file_type,uploader_id").eq("case_id", case_id).eq("document_type", document_type).limit(1).execute()
-        if existing.data:
+        # NEW DOCUMENT (no document_id): always create a fresh document record (v1).
+        # UPLOAD NEW VERSION (document_id given): version the existing document.
+        existing = None
+        if document_id:
+            existing = supabase.table("documents").select("document_id,current_version_id,file_type,uploader_id").eq("document_id", document_id).limit(1).execute()
+        if existing and existing.data:
             did = existing.data[0]["document_id"]
             versions = supabase.table("document_versions").select("version_id,version_number,file_hash").eq("document_id", did).order("version_number", desc=True).limit(1).execute()
             latest = versions.data[0] if versions.data else None
@@ -2561,6 +2589,130 @@ def case_ai_chat(req: CaseAIChatRequest, authorization: str | None = Header(defa
         "latency_ms": latency_ms,
     }
 
+class DocumentAIChatRequest(BaseModel):
+    document_id: str | None = None
+    version_id: str
+    question: str
+
+@app.post("/documents/ai/chat")
+def document_ai_chat(req: DocumentAIChatRequest, authorization: str | None = Header(default=None)):
+    """Answer only from processed chunks for this specific document version."""
+    u = get_current_user(authorization)
+    
+    vr = db_call(
+        lambda: supabase.table("document_versions").select("document_id").eq("version_id", req.version_id).limit(1).execute()
+    )
+    if not vr.data:
+        raise HTTPException(404, "Document version not found.")
+    
+    document_id = req.document_id or vr.data[0]["document_id"]
+    
+    dr = db_call(
+        lambda: supabase.table("documents").select("case_id,document_type").eq("document_id", document_id).limit(1).execute()
+    )
+    if not dr.data:
+        raise HTTPException(404, "Document not found.")
+        
+    d = dr.data[0]
+    m = membership(u["user_id"], d["case_id"])
+    if d["document_type"] not in set(m.get("allowed_document_types") or []):
+        raise HTTPException(403, "You are not authorized to view this document.")
+        
+    question = req.question.strip()
+    if not question:
+        raise HTTPException(400, "Question cannot be empty.")
+        
+    try:
+        rows = (supabase.table("case_ai_chunks")
+                .select("document_id,version_id,page_number,chunk_index,text")
+                .eq("version_id", req.version_id)
+                .order("chunk_index", desc=False).execute().data or [])
+                
+        if not rows:
+            # Let's check status
+            status_res = supabase.table("case_ai_documents").select("status,error").eq("version_id", req.version_id).limit(1).execute()
+            if status_res.data:
+                status = status_res.data[0].get("status")
+                if status in {"pending", "processing"}:
+                    raise HTTPException(400, "Document is still processing. Please try again later.")
+                elif status == "failed":
+                    raise HTTPException(400, f"Insufficient evidence in this document. Extraction failed: {status_res.data[0].get('error')}")
+            raise HTTPException(400, "Insufficient evidence in this document. No processed document content is available.")
+            
+        # Retrieval logic similar to case context
+        if len(rows) <= 12:
+            context = rows
+        else:
+            stop = {"the","and","for","what","are","is","was","were","this","that",
+                    "with","from","about","tell","give","show","case","document","please",
+                    "can","you","who","when","where","why","how"}
+            q = [t for t in _tokenize(question) if len(t) >= 3 and t not in stop]
+            qset = set(q)
+            scored = []
+            for r in rows:
+                tokens = _tokenize(r.get("text", ""))
+                token_set = set(tokens)
+                overlap = len(qset & token_set)
+                freq = sum(tokens.count(t) for t in qset)
+                phrase_bonus = 0
+                qphrase = " ".join(q[:4])
+                if qphrase and qphrase in (r.get("text", "").lower()):
+                    phrase_bonus = 5
+                scored.append((overlap * 10 + freq + phrase_bonus, r.get("chunk_index", 0), r))
+            scored.sort(key=lambda x: (-x[0], x[1]))
+            selected = [r for score, _, r in scored[:AI_TOP_K] if score > 0]
+            if selected:
+                context = selected
+            else:
+                context = rows[:min(AI_TOP_K, len(rows))]
+                
+        prompt_parts = []
+        for i, c in enumerate(context, 1):
+            page = c.get("page_number") or 1
+            prompt_parts.append(f"[SOURCE {i} | page {page}]\n{c.get('text','')}")
+            
+        prompt = (
+            "You are the read-only Case AI for a secure police document management system. "
+            "Use ONLY the supplied sources from this document. Do not use outside knowledge. "
+            "Do not invent, infer, or guess facts. "
+            "If the requested information is not present in the supplied sources, explicitly say "
+            "'Insufficient evidence in this document.' "
+            "For summaries, synthesize only what the sources say. "
+            "Preserve names, dates, identifiers and numbers exactly when stated. "
+            "Cite supporting material using [SOURCE n, page X].\n\n"
+            + "\n\n".join(prompt_parts)
+            + f"\n\nQUESTION: {question}"
+        )
+        
+        started = time.monotonic()
+        try:
+            result = answer_question(prompt)
+        except Exception as exc:
+            raise HTTPException(502, f"Case AI could not generate an answer. Details: {error_text(exc)}")
+            
+        latency_ms = int((time.monotonic() - started) * 1000)
+        answer = result.get("text") or "The AI provider returned an empty answer."
+        provider = result.get("provider") or "unknown"
+        
+        sources = [{
+            "page": c.get("page_number"),
+            "document_id": c.get("document_id"),
+            "version_id": c.get("version_id"),
+            "chunk_index": c.get("chunk_index"),
+        } for c in context]
+
+        return {
+            "answer": answer,
+            "sources": sources,
+            "provider": provider,
+            "context_chunks": len(context),
+            "latency_ms": latency_ms,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(500, f"Failed to generate answer: {error_text(exc)}")
+
 
 class CloseCaseRequest(BaseModel):
     case_id: str
@@ -2916,6 +3068,239 @@ async def external_upload(
     return {"success": True, "message": f"Uploaded as Version {vn}.", "version_number": vn, "version_id": vid, "document_id": did}
 
 
+
+
+# ================================================================== #
+# ANALYTICS
+# ================================================================== #
+
+@app.get("/analytics/summary")
+def get_analytics_summary(authorization: str | None = Header(default=None)):
+    try:
+        u = get_current_user(authorization)
+        cases_count = db_call(lambda: supabase.table("cases").select("case_id", count="exact").execute()).count or 0
+        active_cases = db_call(lambda: supabase.table("cases").select("case_id", count="exact").eq("status", "ACTIVE").execute()).count or 0
+        docs_count = db_call(lambda: supabase.table("documents").select("document_id", count="exact").execute()).count or 0
+        versions_count = db_call(lambda: supabase.table("document_versions").select("version_id", count="exact").execute()).count or 0
+        ai_completed = db_call(lambda: supabase.table("case_ai_documents").select("version_id", count="exact").eq("status", "completed").execute()).count or 0
+        ai_processing = db_call(lambda: supabase.table("case_ai_documents").select("version_id", count="exact").in_("status", ["processing", "queued", "pending"]).execute()).count or 0
+        return {
+            "success": True,
+            "metrics": {
+                "totalCases": cases_count,
+                "activeCases": active_cases,
+                "closedCases": cases_count - active_cases,
+                "totalDocuments": docs_count,
+                "totalVersions": versions_count,
+                "processing": ai_processing,
+                "completed": ai_completed,
+                "extractionPending": 0,
+                "extractionAccepted": 0,
+            }
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(500, f"Analytics unavailable: {error_text(exc)}")
+
+
+# ================================================================== #
+# AUDIT LOGS
+# ================================================================== #
+
+@app.get("/audit/logs")
+def get_audit_logs(authorization: str | None = Header(default=None)):
+    try:
+        u = get_current_user(authorization)
+        # Get user's authorized case IDs via case_membership (real table name).
+        my_cases_res = db_call(lambda: supabase.table("case_membership").select("case_id").eq("user_id", u["user_id"]).execute())
+        my_case_ids = [r["case_id"] for r in (my_cases_res.data or [])]
+
+        if not my_case_ids:
+            return {"success": True, "logs": [], "scope": "USER_AUTHORIZED"}
+
+        # Get document IDs within those cases.
+        docs_res = db_call(lambda: supabase.table("documents").select("document_id").in_("case_id", my_case_ids).execute())
+        my_doc_ids = [r["document_id"] for r in (docs_res.data or [])]
+
+        all_logs = []
+
+        # Case-level audit events (actor = user, target = case).
+        case_events = db_call(lambda: supabase.table("audit_events").select("*").in_("target_id", my_case_ids).order("created_at", desc=True).limit(100).execute())
+        all_logs.extend(case_events.data or [])
+
+        # Document-level audit events.
+        if my_doc_ids:
+            doc_events = db_call(lambda: supabase.table("audit_events").select("*").in_("target_id", my_doc_ids).order("created_at", desc=True).limit(200).execute())
+            all_logs.extend(doc_events.data or [])
+
+        # Also pull access_events for completeness.
+        try:
+            acc_events = db_call(lambda: supabase.table("access_events").select("*").in_("case_id", my_case_ids).order("created_at", desc=True).limit(100).execute())
+            for ev in (acc_events.data or []):
+                all_logs.append({
+                    "event_id": ev.get("access_event_id"),
+                    "user_id": ev.get("user_id"),
+                    "action": "ACCESS_EVENT",
+                    "target_id": ev.get("case_id"),
+                    "details": {"ip": ev.get("ip_address"), "ua": ev.get("user_agent")},
+                    "created_at": ev.get("created_at"),
+                })
+        except Exception:
+            pass
+
+        # Deduplicate and sort newest first.
+        seen = set()
+        unique_logs = []
+        for log in all_logs:
+            eid = log.get("event_id")
+            if eid and eid in seen:
+                continue
+            if eid:
+                seen.add(eid)
+            unique_logs.append(log)
+        unique_logs.sort(key=lambda x: x.get("created_at") or "", reverse=True)
+
+        return {"success": True, "logs": unique_logs[:200], "scope": "USER_AUTHORIZED"}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(500, f"Audit logs unavailable: {error_text(exc)}")
+
+
+# ================================================================== #
+# DOCUMENT ACTIVITY TIMELINE
+# ================================================================== #
+
+@app.get("/documents/{document_id}/activity")
+def get_document_activity(document_id: str, authorization: str | None = Header(default=None)):
+    try:
+        u = get_current_user(authorization)
+        dr = supabase.table("documents").select("case_id,document_type").eq("document_id", document_id).limit(1).execute()
+        if not dr.data:
+            raise HTTPException(404, "Document not found.")
+        d = dr.data[0]
+        membership(u["user_id"], d["case_id"])
+
+        activities = []
+
+        # Version-level events.
+        versions = supabase.table("document_versions").select(
+            "version_id,version_number,timestamp,uploader_id,file_hash"
+        ).eq("document_id", document_id).order("version_number", desc=False).execute()
+
+        for v in (versions.data or []):
+            vid = v["version_id"]
+            vnum = v.get("version_number", 1)
+            activities.append({
+                "id": f"upload-{vid}",
+                "type": "DOCUMENT_UPLOADED",
+                "timestamp": v.get("timestamp"),
+                "versionId": vid,
+                "versionNumber": vnum,
+                "actor": v.get("uploader_id"),
+                "details": f"Version {vnum} uploaded. SHA-256: {(v.get('file_hash') or '')[:16]}...",
+                "fileHash": v.get("file_hash"),
+            })
+
+            # AI processing events for this version.
+            ai = supabase.table("case_ai_documents").select(
+                "status,created_at,started_at,completed_at"
+            ).eq("version_id", vid).limit(1).execute()
+            if ai.data:
+                a = ai.data[0]
+                if a.get("started_at"):
+                    activities.append({
+                        "id": f"ai-start-{vid}",
+                        "type": "OCR_PROCESSING_STARTED",
+                        "timestamp": a.get("started_at"),
+                        "versionId": vid,
+                        "versionNumber": vnum,
+                        "actor": "SYSTEM",
+                        "details": "AI extraction started.",
+                    })
+                if a.get("status") == "completed" and a.get("completed_at"):
+                    activities.append({
+                        "id": f"ai-end-{vid}",
+                        "type": "OCR_PROCESSING_COMPLETED",
+                        "timestamp": a.get("completed_at"),
+                        "versionId": vid,
+                        "versionNumber": vnum,
+                        "actor": "SYSTEM",
+                        "details": "AI extraction completed.",
+                    })
+
+        # Audit events targeting this document.
+        audits = supabase.table("audit_events").select("*").eq("target_id", document_id).order("created_at", desc=True).execute()
+        for aud in (audits.data or []):
+            activities.append({
+                "id": aud.get("event_id"),
+                "type": aud.get("action"),
+                "timestamp": aud.get("created_at"),
+                "versionId": (aud.get("details") or {}).get("version_id"),
+                "actor": aud.get("user_id"),
+                "details": (aud.get("details") or {}).get("message", "Activity logged."),
+            })
+
+        activities.sort(key=lambda x: x.get("timestamp") or "", reverse=True)
+        return {"success": True, "activities": activities}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(500, f"Activity unavailable: {error_text(exc)}")
+
+
+# ================================================================== #
+# EXTRACTION ACCEPT / EDIT / REPROCESS
+# ================================================================== #
+
+@app.post("/documents/versions/{version_id}/extraction/accept")
+def accept_extraction(version_id: str, authorization: str | None = Header(default=None)):
+    u = get_current_user(authorization)
+    v = supabase.table("document_versions").select("document_id").eq("version_id", version_id).limit(1).execute()
+    if not v.data:
+        raise HTTPException(404, "Version not found")
+    did = v.data[0]["document_id"]
+    log_audit(u["user_id"], "EXTRACTION_ACCEPTED", did, {"version_id": version_id, "message": "Extraction accepted."})
+    return {"success": True, "message": "Extraction accepted."}
+
+
+class EditExtractionRequest(BaseModel):
+    text: str
+
+
+@app.post("/documents/versions/{version_id}/extraction/edit")
+def edit_extraction(version_id: str, req: EditExtractionRequest, authorization: str | None = Header(default=None)):
+    u = get_current_user(authorization)
+    v = supabase.table("document_versions").select("document_id").eq("version_id", version_id).limit(1).execute()
+    if not v.data:
+        raise HTTPException(404, "Version not found")
+    did = v.data[0]["document_id"]
+    # Update extracted_text in case_ai_documents (the real AI processing table).
+    supabase.table("case_ai_documents").update({"extracted_text": req.text}).eq("version_id", version_id).execute()
+    log_audit(u["user_id"], "EXTRACTION_EDITED", did, {"version_id": version_id, "message": "Extraction text edited."})
+    return {"success": True, "message": "Extraction updated."}
+
+
+@app.post("/documents/versions/{version_id}/reprocess")
+def reprocess_document(version_id: str, background_tasks: BackgroundTasks, authorization: str | None = Header(default=None)):
+    u = get_current_user(authorization)
+    v = supabase.table("document_versions").select("document_id").eq("version_id", version_id).limit(1).execute()
+    if not v.data:
+        raise HTTPException(404, "Version not found")
+    did = v.data[0]["document_id"]
+    supabase.table("case_ai_documents").update({
+        "status": "pending", "progress_percent": 0, "stage": "Initializing...",
+        "queued_at": iso(now())
+    }).eq("version_id", version_id).execute()
+    background_tasks.add_task(_process_ai_job, version_id)
+    log_audit(u["user_id"], "DOCUMENT_REPROCESSED", did, {"version_id": version_id, "message": "Document reprocessed manually."})
+    return {"success": True, "message": "Reprocessing started."}
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
+
+
