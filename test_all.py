@@ -2,10 +2,42 @@ import requests
 import json
 import time
 import os
+import threading
+import re
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
-BASE_URL = "http://localhost:8000"
+captured_otp = None
+
+class MockResendHandler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        global captured_otp
+        print(f"[MOCK_SERVER] Received POST {self.path}")
+        try:
+            content_length = int(self.headers['Content-Length'])
+            post_data = self.rfile.read(content_length)
+            data = json.loads(post_data)
+            match = re.search(r'verification code is: (\d{6})', data.get("text", ""))
+            if match:
+                captured_otp = match.group(1)
+                print(f"[MOCK_SERVER] Captured OTP: {captured_otp}")
+            else:
+                print(f"[MOCK_SERVER] OTP not found in text: {data.get('text')}")
+        except Exception as e:
+            print(f"[MOCK_SERVER] Error processing request: {e}")
+        self.send_response(200)
+        self.send_header('Content-type', 'application/json')
+        self.end_headers()
+        self.wfile.write(b'{"id":"mock_id"}')
+    def log_message(self, format, *args):
+        pass
+
+server = HTTPServer(('localhost', 8081), MockResendHandler)
+threading.Thread(target=server.serve_forever, daemon=True).start()
+
+BASE_URL = "http://localhost:8001"
 
 def test_flow():
+    global captured_otp
     print("=== STARTING FULL SYSTEM TEST ===")
     
     # 1. Login
@@ -68,8 +100,12 @@ def test_flow():
     print("5b. OTP for MANAGE_MEMBERS...")
     resp = requests.post(f"{BASE_URL}/security/request-otp", headers=headers, json={"purpose": "MANAGE_MEMBERS", "case_id": case_id})
     if resp.status_code != 200: print("FAIL Request OTP:", resp.text); return False
-    time.sleep(1)
-    otp = "123456"
+    # Wait for OTP
+    for _ in range(50):
+        if captured_otp: break
+        time.sleep(0.1)
+    otp = captured_otp
+    captured_otp = None
     resp = requests.post(f"{BASE_URL}/security/verify-otp", headers=headers, json={"purpose": "MANAGE_MEMBERS", "code": otp, "case_id": case_id})
     if resp.status_code != 200: print("FAIL Verify OTP:", resp.text); return False
     
@@ -88,8 +124,12 @@ def test_flow():
         print("FAIL Request OTP:", resp.text)
         return False
         
-    time.sleep(1)
-    otp = "123456"
+    # Wait for OTP
+    for _ in range(50):
+        if captured_otp: break
+        time.sleep(0.1)
+    otp = captured_otp
+    captured_otp = None
         
     resp = requests.post(f"{BASE_URL}/security/verify-otp", headers=headers, json={"purpose": "document_upload", "code": otp, "case_id": case_id})
     if resp.status_code != 200:
@@ -134,8 +174,15 @@ def test_flow():
     print("10a. OTP for VIEW_FILES...")
     resp = requests.post(f"{BASE_URL}/security/request-otp", headers=headers, json={"purpose": "VIEW_FILES", "case_id": case_id})
     if resp.status_code != 200: print("FAIL Request OTP VIEW_FILES:", resp.text); return False
-    time.sleep(1)
-    resp = requests.post(f"{BASE_URL}/security/verify-otp", headers=headers, json={"purpose": "VIEW_FILES", "code": "123456", "case_id": case_id})
+    
+    # Wait for OTP
+    for _ in range(50):
+        if captured_otp: break
+        time.sleep(0.1)
+    otp = captured_otp
+    captured_otp = None
+    
+    resp = requests.post(f"{BASE_URL}/security/verify-otp", headers=headers, json={"purpose": "VIEW_FILES", "code": otp, "case_id": case_id})
     if resp.status_code != 200: print("FAIL Verify OTP VIEW_FILES:", resp.text); return False
     
     resp = requests.get(f"{BASE_URL}/documents/versions/{doc_id}", headers=headers)
@@ -169,4 +216,32 @@ def test_flow():
     return True
 
 if __name__ == "__main__":
-    test_flow()
+    import subprocess
+    import sys
+    
+    # Spawn dedicated test backend
+    env = os.environ.copy()
+    env["RESEND_API_URL"] = "http://localhost:8081/emails"
+    
+    print("Starting dedicated test backend on port 8001...")
+    server_process = subprocess.Popen(
+        [sys.executable, "-m", "uvicorn", "invite_backend:app", "--port", "8001"],
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL
+    )
+    
+    # Wait for server to be ready
+    time.sleep(3)
+    
+    success = False
+    try:
+        success = test_flow()
+    finally:
+        print("Terminating test backend...")
+        server_process.terminate()
+        server_process.wait()
+        
+    if not success:
+        sys.exit(1)
+    sys.exit(0)

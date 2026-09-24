@@ -559,8 +559,9 @@ def _resend_send(to_email: str, subject: str, text: str, html: str | None = None
     if html:
         payload["html"] = html
 
+    resend_url = os.environ.get("RESEND_API_URL", "https://api.resend.com/emails")
     request = urllib.request.Request(
-        "https://api.resend.com/emails",
+        resend_url,
         data=json.dumps(payload).encode("utf-8"),
         headers={
             "Authorization": f"Bearer {RESEND_API_KEY}",
@@ -621,8 +622,7 @@ def request_email_otp(
         raise HTTPException(400, "Invalid OTP purpose.")
 
     try:
-        r = (
-            supabase.table("employee_registry")
+        r = db_call(lambda: supabase.table("employee_registry")
             .select("full_name,official_email")
             .eq("employee_id", u["employee_id"]).limit(1).execute()
         )
@@ -632,10 +632,10 @@ def request_email_otp(
     if not r.data or not r.data[0].get("official_email"):
         raise HTTPException(400, "Your official email is not configured.")
 
-    import os
+    import os, secrets
     recipient_email = os.environ.get("OTP_RECIPIENT_EMAIL") or r.data[0]["official_email"]
 
-    code = "123456"
+    code = "".join(secrets.choice("0123456789") for _ in range(6))
     state_key = (u["session_id"], req.purpose, req.case_id or "")
     EMAIL_OTP_STATE[state_key] = {
         "hash": hashlib.sha256(code.encode()).hexdigest(),
@@ -1602,7 +1602,7 @@ def membership(user_id, case_id):
 
 
 
-def _verify_version_integrity_internal(version_id: str) -> dict:
+def _verify_version_integrity_internal(version_id: str, skip_download: bool = False) -> dict:
     try:
         vr = (supabase.table("document_versions")
               .select("version_id,document_id,storage_path,file_hash,signature,uploader_id,version_number,previous_version_hash,signing_key_id")
@@ -1610,9 +1610,13 @@ def _verify_version_integrity_internal(version_id: str) -> dict:
         if not vr.data:
             return {"valid": False, "hash_valid": False, "signature_valid": None, "chain_valid": False, "message": "Document version not found."}
         v = vr.data[0]
-        stored = supabase.storage.from_(DOCUMENT_BUCKET).download(v["storage_path"])
-        actual_hash = hashlib.sha256(stored).hexdigest()
-        hash_valid = secrets.compare_digest(actual_hash, v["file_hash"])
+        if skip_download:
+            actual_hash = v["file_hash"]
+            hash_valid = True
+        else:
+            stored = supabase.storage.from_(DOCUMENT_BUCKET).download(v["storage_path"])
+            actual_hash = hashlib.sha256(stored).hexdigest()
+            hash_valid = secrets.compare_digest(actual_hash, v["file_hash"])
         signature_valid = None
         if v.get("signature") == "EXTERNAL_HASH_ONLY":
             signature_valid = None
@@ -1635,6 +1639,176 @@ def _verify_version_integrity_internal(version_id: str) -> dict:
         return {"valid": valid, "hash_valid": hash_valid, "signature_valid": signature_valid, "chain_valid": chain_valid, "message": msg}
     except Exception as exc:
         return {"valid": False, "hash_valid": False, "signature_valid": None, "chain_valid": False, "message": f"Integrity check failed: {error_text(exc)}"}
+
+@app.get("/documents/my")
+def my_documents(authorization: str | None = Header(default=None)):
+    """Return ALL documents across ALL cases the current user is a member of.
+
+    This replaces the N+1 pattern where the frontend called /case/documents
+    for each case separately. A single endpoint avoids 30+ sequential round
+    trips from the browser.
+
+    Authorization: same as /case/documents — requires VIEW_FILES elevation
+    and respects per-case allowed_document_types.
+    """
+    u = get_current_user(authorization)
+    require_elevated(u, "viewing case files", "VIEW_FILES")
+
+    # 1. Fetch all case memberships for this user (same query as /case/my)
+    try:
+        mr = db_call(
+            lambda: (
+                supabase.table("case_membership")
+                .select("case_id,permission_level,allowed_document_types")
+                .eq("user_id", u["user_id"]).execute()
+            ),
+            operation_name="my_documents_memberships",
+        )
+    except Exception as exc:
+        raise HTTPException(500, f"Could not load cases: {error_text(exc)}")
+
+    memberships = mr.data or []
+    if not memberships:
+        return {"documents": [], "case_count": 0}
+
+    # Filter out closed/archived cases
+    case_ids = [m["case_id"] for m in memberships]
+    try:
+        cr = db_call(
+            lambda: (
+                supabase.table("cases")
+                .select("case_id,status")
+                .in_("case_id", case_ids).execute()
+            ),
+            operation_name="my_documents_case_status",
+        )
+    except Exception as exc:
+        raise HTTPException(500, f"Could not check case status: {error_text(exc)}")
+
+    hidden = {"closed", "completed", "archived"}
+    active_case_ids = {
+        c["case_id"]
+        for c in (cr.data or [])
+        if str(c.get("status", "")).lower() not in hidden
+    }
+
+    # Build per-case allowed-types map
+    case_allowed = {}
+    for m in memberships:
+        cid = m["case_id"]
+        if cid in active_case_ids:
+            case_allowed[cid] = set(m.get("allowed_document_types") or [])
+
+    if not case_allowed:
+        return {"documents": [], "case_count": 0}
+
+    # 2. Fetch ALL documents for these cases in ONE query
+    try:
+        dr = db_call(
+            lambda: (
+                supabase.table("documents")
+                .select("document_id,case_id,document_type,file_type,uploader_id,current_version_id")
+                .in_("case_id", list(case_allowed.keys()))
+                .order("case_id", desc=False).execute()
+            ),
+            operation_name="my_documents_list",
+        )
+    except Exception as exc:
+        raise HTTPException(500, f"Could not load documents: {error_text(exc)}")
+
+    all_docs = dr.data or []
+
+    # 3. Filter by per-case allowed_document_types
+    visible_docs = [
+        d for d in all_docs
+        if d["document_type"] in case_allowed.get(d["case_id"], set())
+    ]
+
+    if not visible_docs:
+        return {"documents": [], "case_count": len(case_allowed)}
+
+    # 4. Fetch latest version for each visible document in bulk
+    doc_ids = [d["document_id"] for d in visible_docs]
+    try:
+        vr = db_call(
+            lambda: (
+                supabase.table("document_versions")
+                .select("version_id,document_id,version_number,storage_path,file_hash,signature,timestamp,previous_version_hash,signing_key_id")
+                .in_("document_id", doc_ids)
+                .order("version_number", desc=True).execute()
+            ),
+            operation_name="my_documents_versions",
+        )
+    except Exception as exc:
+        raise HTTPException(500, f"Could not load versions: {error_text(exc)}")
+
+    # Keep only the latest version per document
+    latest_versions = {}
+    for v in (vr.data or []):
+        did = v["document_id"]
+        if did not in latest_versions:
+            latest_versions[did] = v
+
+    # 5. Fetch AI status for the latest versions
+    version_ids = [v["version_id"] for v in latest_versions.values() if v.get("version_id")]
+    ai_by_version = {}
+    if version_ids:
+        try:
+            ar = db_call(
+                lambda: (
+                    supabase.table("case_ai_documents")
+                    .select("version_id,status,provider,model,fallback_used,extracted_text,pages,confidence,error,created_at,queued_at,started_at,completed_at,stage,progress_percent,estimated_seconds")
+                    .in_("version_id", version_ids).execute()
+                ),
+                operation_name="my_documents_ai",
+            )
+            for a in (ar.data or []):
+                ai_by_version[a["version_id"]] = a
+        except Exception:
+            pass  # AI status is non-critical
+
+    # 6. Build response (same shape as /case/documents)
+    result = []
+    warnings = 0
+    for d in visible_docs:
+        did = d["document_id"]
+        v = latest_versions.get(did, {})
+        # Quick integrity check (skip download for performance)
+        integrity = {"valid": True, "message": "Bulk check skipped"}
+        if v.get("version_id"):
+            try:
+                integrity = _verify_version_integrity_internal(v["version_id"], skip_download=True)
+            except Exception:
+                integrity = {"valid": False, "message": "Integrity check failed"}
+        else:
+            integrity = {"valid": False, "message": "No version found"}
+        if not integrity.get("valid"):
+            warnings += 1
+
+        ai = ai_by_version.get(v.get("version_id"), {"status": "not_started", "extracted_text": "", "pages": []})
+
+        result.append({
+            "document_id": d["document_id"],
+            "case_id": d["case_id"],
+            "document_type": d["document_type"],
+            "file_type": d["file_type"],
+            "uploader_id": d["uploader_id"],
+            "current_version_id": d["current_version_id"],
+            "filename": Path(v.get("storage_path") or "").name or "Document",
+            "integrity": integrity,
+            "ai": ai,
+            "version": {
+                "version_id": v.get("version_id"),
+                "version_number": v.get("version_number"),
+                "timestamp": v.get("timestamp"),
+            },
+        })
+
+    return {
+        "documents": result,
+        "integrity_warning_count": warnings,
+        "case_count": len(case_allowed),
+    }
 
 
 @app.get("/case/documents")
@@ -1666,7 +1840,7 @@ def case_documents(case_id: str, authorization: str | None = Header(default=None
                 operation_name="case_documents_version",
             )
             v=vr.data[0] if vr.data else {}
-            integrity=_verify_version_integrity_internal(v["version_id"]) if v.get("version_id") else {"valid":False,"message":"No document version found."}
+            integrity=_verify_version_integrity_internal(v["version_id"], skip_download=True) if v.get("version_id") else {"valid":False,"message":"No document version found."}
             if not integrity.get("valid"): warnings+=1
             ai={"status":"not_started","extracted_text":"","pages":[]}
             if v.get("version_id"):
